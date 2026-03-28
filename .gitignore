@@ -1,5 +1,6 @@
 node_modules/
 dist/
+!extension/dist/
 *.tsbuildinfo
 .opencli/
 .mcp.json

@@ -1,241 +1,27 @@
 /**
- * MCP server path discovery and argument building.
+ * Daemon discovery — simplified from MCP server path discovery.
+ *
+ * Only needs to check if the daemon is running. No more file system
+ * scanning for @playwright/mcp locations.
  */
 
-import { execSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { isDaemonRunning } from './daemon-client.js';
 
-let _cachedMcpServerPath: string | null | undefined;
-let _existsSync = fs.existsSync;
-let _execSync = execSync;
-
-function isSupportedMcpEntrypoint(candidate: string): boolean {
-  const normalized = candidate.replace(/\\/g, '/').toLowerCase();
-  return normalized.endsWith('/@playwright/mcp/cli.js') ||
-    normalized.endsWith('/mcp-server-playwright') ||
-    normalized.endsWith('/mcp-server-playwright.js');
-}
-
-function resolveSupportedMcpPath(candidate: string | null | undefined): string | null {
-  const trimmed = candidate?.trim();
-  if (!trimmed || !_existsSync(trimmed)) return null;
-  return isSupportedMcpEntrypoint(trimmed) ? trimmed : null;
-}
-
-export function resetMcpServerPathCache(): void {
-  _cachedMcpServerPath = undefined;
-}
-
-export function setMcpDiscoveryTestHooks(input?: {
-  existsSync?: typeof fs.existsSync;
-  execSync?: typeof execSync;
-}): void {
-  _existsSync = input?.existsSync ?? fs.existsSync;
-  _execSync = input?.execSync ?? execSync;
-}
-
-export function findMcpServerPath(): string | null {
-  if (_cachedMcpServerPath !== undefined) return _cachedMcpServerPath;
-
-  const envMcp = process.env.OPENCLI_MCP_SERVER_PATH;
-  if (envMcp && _existsSync(envMcp)) {
-    _cachedMcpServerPath = envMcp;
-    return _cachedMcpServerPath;
-  }
-
-  // Check local node_modules first (@playwright/mcp is the modern package)
-  const localMcp = path.resolve('node_modules', '@playwright', 'mcp', 'cli.js');
-  if (_existsSync(localMcp)) {
-    _cachedMcpServerPath = localMcp;
-    return _cachedMcpServerPath;
-  }
-
-  // Check project-relative path
-  const __dirname2 = path.dirname(fileURLToPath(import.meta.url));
-  const projectMcp = path.resolve(__dirname2, '..', '..', 'node_modules', '@playwright', 'mcp', 'cli.js');
-  if (_existsSync(projectMcp)) {
-    _cachedMcpServerPath = projectMcp;
-    return _cachedMcpServerPath;
-  }
-
-  // Check global npm/yarn locations derived from current Node runtime.
-  const nodePrefix = path.resolve(path.dirname(process.execPath), '..');
-  const globalNodeModules = path.join(nodePrefix, 'lib', 'node_modules');
-  const globalMcp = path.join(globalNodeModules, '@playwright', 'mcp', 'cli.js');
-  if (_existsSync(globalMcp)) {
-    _cachedMcpServerPath = globalMcp;
-    return _cachedMcpServerPath;
-  }
-
-  // Check npm global root directly.
-  try {
-    const npmRootGlobal = _execSync('npm root -g 2>/dev/null', {
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).trim();
-    const npmGlobalMcp = path.join(npmRootGlobal, '@playwright', 'mcp', 'cli.js');
-    if (npmRootGlobal && _existsSync(npmGlobalMcp)) {
-      _cachedMcpServerPath = npmGlobalMcp;
-      return _cachedMcpServerPath;
-    }
-  } catch {}
-
-  // Check common locations
-  const candidates = [
-    path.join(os.homedir(), '.npm', '_npx'),
-    path.join(os.homedir(), 'node_modules', '.bin'),
-    '/usr/local/lib/node_modules',
-  ];
-
-  // Try npx resolution (legacy package name)
-  try {
-    const result = _execSync('npx -y --package=@playwright/mcp which mcp-server-playwright 2>/dev/null', { encoding: 'utf-8', timeout: 10000 }).trim();
-    const resolved = resolveSupportedMcpPath(result);
-    if (resolved) {
-      _cachedMcpServerPath = resolved;
-      return _cachedMcpServerPath;
-    }
-  } catch {}
-
-  // Try which
-  try {
-    const result = _execSync('which mcp-server-playwright 2>/dev/null', { encoding: 'utf-8', timeout: 5000 }).trim();
-    const resolved = resolveSupportedMcpPath(result);
-    if (resolved) {
-      _cachedMcpServerPath = resolved;
-      return _cachedMcpServerPath;
-    }
-  } catch {}
-
-  // Search in common npx cache
-  for (const base of candidates) {
-    if (!_existsSync(base)) continue;
-    try {
-      const found = _execSync(`find "${base}" -type f -path "*/@playwright/mcp/cli.js" 2>/dev/null | head -1`, { encoding: 'utf-8', timeout: 5000 }).trim();
-      const resolved = resolveSupportedMcpPath(found);
-      if (resolved) {
-        _cachedMcpServerPath = resolved;
-        return _cachedMcpServerPath;
-      }
-    } catch {}
-  }
-
-  _cachedMcpServerPath = null;
-  return _cachedMcpServerPath;
-}
+export { isDaemonRunning };
 
 /**
- * Chrome 144+ auto-discovery: read DevToolsActivePort file to get CDP endpoint.
- *
- * Starting with Chrome 144, users can enable remote debugging from
- * chrome://inspect#remote-debugging without any command-line flags.
- * Chrome writes the active port and browser GUID to a DevToolsActivePort file
- * in the user data directory, which we read to construct the WebSocket endpoint.
+ * Check daemon status and return connection info.
  */
-export function discoverChromeEndpoint(): string | null {
-  const candidates: string[] = [];
-
-  // User-specified Chrome data dir takes highest priority
-  if (process.env.CHROME_USER_DATA_DIR) {
-    candidates.push(path.join(process.env.CHROME_USER_DATA_DIR, 'DevToolsActivePort'));
+export async function checkDaemonStatus(): Promise<{
+  running: boolean;
+  extensionConnected: boolean;
+}> {
+  try {
+    const port = parseInt(process.env.OPENCLI_DAEMON_PORT ?? '19825', 10);
+    const res = await fetch(`http://127.0.0.1:${port}/status`);
+    const data = await res.json() as { ok: boolean; extensionConnected: boolean };
+    return { running: true, extensionConnected: data.extensionConnected };
+  } catch {
+    return { running: false, extensionConnected: false };
   }
-
-  // Standard Chrome/Edge user data dirs per platform
-  if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
-    candidates.push(path.join(localAppData, 'Google', 'Chrome', 'User Data', 'DevToolsActivePort'));
-    candidates.push(path.join(localAppData, 'Microsoft', 'Edge', 'User Data', 'DevToolsActivePort'));
-  } else if (process.platform === 'darwin') {
-    candidates.push(path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome', 'DevToolsActivePort'));
-    candidates.push(path.join(os.homedir(), 'Library', 'Application Support', 'Microsoft Edge', 'DevToolsActivePort'));
-  } else {
-    candidates.push(path.join(os.homedir(), '.config', 'google-chrome', 'DevToolsActivePort'));
-    candidates.push(path.join(os.homedir(), '.config', 'chromium', 'DevToolsActivePort'));
-    candidates.push(path.join(os.homedir(), '.config', 'microsoft-edge', 'DevToolsActivePort'));
-  }
-
-  for (const filePath of candidates) {
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8').trim();
-      const lines = content.split('\n');
-      if (lines.length >= 2) {
-        const port = parseInt(lines[0], 10);
-        const browserPath = lines[1]; // e.g. /devtools/browser/<GUID>
-        if (port > 0 && browserPath.startsWith('/devtools/browser/')) {
-          return `ws://127.0.0.1:${port}${browserPath}`;
-        }
-      }
-    } catch {}
-  }
-  return null;
-}
-
-export function resolveCdpEndpoint(): { endpoint?: string; requestedCdp: boolean } {
-  const envVal = process.env.OPENCLI_CDP_ENDPOINT;
-  if (envVal === '1' || envVal?.toLowerCase() === 'true') {
-    const autoDiscovered = discoverChromeEndpoint();
-    return { endpoint: autoDiscovered ?? envVal, requestedCdp: true };
-  }
-
-  if (envVal) {
-    return { endpoint: envVal, requestedCdp: true };
-  }
-
-  // Fallback to auto-discovery if not explicitly set
-  const autoDiscovered = discoverChromeEndpoint();
-  if (autoDiscovered) {
-    return { endpoint: autoDiscovered, requestedCdp: true };
-  }
-
-  return { requestedCdp: false };
-}
-
-function buildRuntimeArgs(input?: { executablePath?: string | null; cdpEndpoint?: string }): string[] {
-  const args: string[] = [];
-
-  // Priority 1: CDP endpoint (remote Chrome debugging or local Auto-Discovery)
-  if (input?.cdpEndpoint) {
-    args.push('--cdp-endpoint', input.cdpEndpoint);
-    return args;
-  }
-
-  // Priority 2: Extension mode (local Chrome with MCP Bridge extension)
-  if (!process.env.CI) {
-    args.push('--extension');
-  }
-
-  // CI/standalone mode: @playwright/mcp launches its own browser (headed by default).
-  // xvfb provides a virtual display for headed mode in GitHub Actions.
-  if (input?.executablePath) {
-    args.push('--executable-path', input.executablePath);
-  }
-  return args;
-}
-
-export function buildMcpArgs(input: { mcpPath: string; executablePath?: string | null; cdpEndpoint?: string }): string[] {
-  return [input.mcpPath, ...buildRuntimeArgs(input)];
-}
-
-export function buildMcpLaunchSpec(input: { mcpPath?: string | null; executablePath?: string | null; cdpEndpoint?: string }): {
-  command: string;
-  args: string[];
-  usedNpxFallback: boolean;
-} {
-  const runtimeArgs = buildRuntimeArgs(input);
-  if (input.mcpPath) {
-    return {
-      command: 'node',
-      args: [input.mcpPath, ...runtimeArgs],
-      usedNpxFallback: false,
-    };
-  }
-
-  return {
-    command: 'npx',
-    args: ['-y', '@playwright/mcp@latest', ...runtimeArgs],
-    usedNpxFallback: true,
-  };
 }

@@ -4,7 +4,7 @@
  */
 
 import type { IPage } from '../../types.js';
-import { render, normalizeEvaluateSource } from '../template.js';
+import { render } from '../template.js';
 
 export async function stepNavigate(page: IPage | null, params: any, data: any, args: Record<string, any>): Promise<any> {
   const url = render(params, { args, data });
@@ -52,7 +52,7 @@ export async function stepSnapshot(page: IPage | null, params: any, _data: any, 
 
 export async function stepEvaluate(page: IPage | null, params: any, data: any, args: Record<string, any>): Promise<any> {
   const js = String(render(params, { args, data }));
-  let result = await page!.evaluate(normalizeEvaluateSource(js));
+  let result = await page!.evaluate(js);
   // MCP may return JSON as a string — auto-parse it
   if (typeof result === 'string') {
     const trimmed = result.trim();

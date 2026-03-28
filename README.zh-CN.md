@@ -50,61 +50,20 @@ CLI all electron！现在支持把所有 electron 应用 CLI 化，从而组合�
 
 > **⚠️ 重要**：大多数命令复用你的 Chrome 登录状态。运行命令前，你必须已在 Chrome 中打开目标网站并完成登录。如果获取到空数据或报错，请先检查你的浏览器登录状态。
 
-OpenCLI 通过 Playwright MCP Bridge 扩展与你的浏览器通信。
-它会优先复用本地或全局已安装的 `@playwright/mcp`，如果没有嗅探到可用 MCP server，则会自动回退到 `npx -y @playwright/mcp@latest` 启动。
+OpenCLI 通过轻量化的 **Browser Bridge** Chrome 扩展 + 微型 daemon 与浏览器通信（零配置，自动启动）。
 
-### Playwright MCP Bridge 扩展配置
+### Browser Bridge 扩展配置
 
-1. 安装 **[Playwright MCP Bridge](https://chromewebstore.google.com/detail/playwright-mcp-bridge/mmlmfjhmonkocbjadbfplnigmagldckm)** 扩展
-2. 运行 `opencli setup` — 自动发现 Token、分发到各工具、验证连通性：
+1. 在 Chrome 中安装 **opencli Browser Bridge** 扩展：
+   - 打开 `chrome://extensions`，启用右上角的 **开发者模式**
+   - 点击 **加载已解压的扩展程序**，选择本仓库的 `extension/` 文件夹
+2. 完成！运行任何浏览器命令时 daemon 会自动启动。无需 token，无需手动配置。
 
-```bash
-opencli setup
-```
-
-交互式 TUI 会：
-- 🔍 从 Chrome 自动发现 `PLAYWRIGHT_MCP_EXTENSION_TOKEN`（无需手动复制）
-- ☑️ 显示所有支持的工具（Codex、Cursor、Claude Code、Gemini CLI 等）
-- ✏️ 只更新你选中的文件（空格切换，回车确认）
-- 🔌 完成后自动验证浏览器连通性
-
-> **Tip**：后续诊断和维护用 `opencli doctor`：
+> **Tip**：后续诊断用 `opencli doctor`：
 > ```bash
-> opencli doctor            # 只读 Token 与配置诊断
-> opencli doctor --live     # 额外测试浏览器连通性
-> opencli doctor --fix      # 修复不一致的配置（交互确认）
-> opencli doctor --fix -y   # 无交互直接修复所有配置
+> opencli doctor            # 检查扩展和 daemon 连通性
+> opencli doctor --live     # 额外测试浏览器命令
 > ```
-
-**备选方案：CDP 模式 (适用于服务器/无头环境)**
-如果你无法安装浏览器扩展（比如在远程无头服务器上运行 OpenCLI），你可以通过 SSH 隧道或反向代理，利用 CDP (Chrome DevTools Protocol) 连接到本地的 Chrome 浏览器。详细指南请参考 [CDP 连接教程](./CDP.zh-CN.md)。
-
-<details>
-<summary>手动配置（备选方案）</summary>
-
-配置你的 MCP 客户端（如 Claude/Cursor 等）：
-
-```json
-{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--extension"],
-      "env": {
-        "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "<你的-token>"
-      }
-    }
-  }
-}
-```
-
-在终端环境变量中导出（建议写进 `~/.zshrc`）：
-
-```bash
-export PLAYWRIGHT_MCP_EXTENSION_TOKEN="<你的-token>"
-```
-
-</details>
 
 ## 快速开始
 
@@ -112,7 +71,6 @@ export PLAYWRIGHT_MCP_EXTENSION_TOKEN="<你的-token>"
 
 ```bash
 npm install -g @jackwener/opencli
-opencli setup   # 首次使用：配置 Playwright MCP token
 ```
 
 直接使用：
@@ -162,6 +120,7 @@ npm install -g @jackwener/opencli@latest
 | **antigravity** | `status` `send` `read` `new` `evaluate` | 🖥️ 桌面端 |
 | **chatgpt** | `status` `new` `send` `read` `ask` | 🖥️ 桌面端 |
 | **xiaohongshu** | `search` `notifications` `feed` `me` `user` `download` | 🔐 浏览器 |
+| **apple-podcasts** | `search` `episodes` `top` | 🌐 公开 |
 | **xiaoyuzhou** | `podcast` `podcast-episodes` `episode` | 🌐 公开 |
 | **zhihu** | `hot` `search` `question` `download` | 🔐 浏览器 |
 | **youtube** | `search` `video` `transcript` | 🔐 浏览器 |
@@ -280,16 +239,15 @@ opencli cascade https://api.example.com/data
 
 ## 常见问题排查
 
-- **"Failed to connect to Playwright MCP Bridge"** 报错
-  - 确保你当前的 Chrome 已安装且**开启了** Playwright MCP Bridge 浏览器插件。
-  - 如果是刚装完插件，需要重启 Chrome 浏览器。
+- **"Extension not connected" 报错**
+  - 确保你当前的 Chrome 已安装且**开启了** opencli Browser Bridge 扩展（在 `chrome://extensions` 中检查）。
 - **返回空数据，或者报错 "Unauthorized"**
-  - Chrome 里的登录态可能已经过期（甚至被要求过滑动验证码）。请打开当前 Chrome 页面，在新标签页重新手工登录或刷新该页面。
+  - Chrome 里的登录态可能已经过期。请打开当前 Chrome 页面，在新标签页重新手工登录或刷新该页面。
 - **Node API 错误 (如 parseArgs, fs 等)**
-  - 确保 Node.js 版本 `>= 20`。旧版不支持我们使用的现代核心库 API。
-- **Token 问题**
-  - 运行 `opencli doctor` 诊断所有工具的 Token 配置状态。
-  - 使用 `opencli doctor --live` 测试浏览器连通性。
+  - 确保 Node.js 版本 `>= 20`。
+- **Daemon 问题**
+  - 检查 daemon 状态：`curl localhost:19825/status`
+  - 查看扩展日志：`curl localhost:19825/logs`
 
 ## 版本发布
 

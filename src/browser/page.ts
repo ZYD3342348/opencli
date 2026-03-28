@@ -1,139 +1,243 @@
 /**
- * Page abstraction wrapping JSON-RPC calls to Playwright MCP.
+ * Page abstraction — implements IPage by sending commands to the daemon.
+ *
+ * All browser operations are ultimately 'exec' (JS evaluation via CDP)
+ * plus a few native Chrome Extension APIs (tabs, cookies, navigate).
+ *
+ * IMPORTANT: After goto(), we remember the tabId returned by the navigate
+ * action and pass it to all subsequent commands. This avoids the issue
+ * where resolveTabId() in the extension picks a chrome:// or
+ * chrome-extension:// tab that can't be debugged.
  */
 
 import { formatSnapshot } from '../snapshotFormatter.js';
-import { normalizeEvaluateSource } from '../pipeline/template.js';
-import { generateInterceptorJs, generateReadInterceptedJs } from '../interceptor.js';
 import type { IPage } from '../types.js';
-import { BrowserConnectError } from '../errors.js';
+import { sendCommand } from './daemon-client.js';
 
 /**
- * Page abstraction wrapping JSON-RPC calls to Playwright MCP.
+ * Page — implements IPage by talking to the daemon via HTTP.
  */
 export class Page implements IPage {
-  constructor(private _request: (method: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>) {}
+  /** Active tab ID, set after navigate and used in all subsequent commands */
+  private _tabId: number | undefined;
 
-  async call(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const resp = await this._request(method, params);
-    if (resp.error) throw new Error(`page.${method}: ${(resp.error as any).message ?? JSON.stringify(resp.error)}`);
-    // Extract text content from MCP result
-    const result = resp.result as any;
-
-    if (result?.isError) {
-      const errorText = result.content?.find((c: any) => c.type === 'text')?.text || 'Unknown MCP Error';
-      throw new BrowserConnectError(
-        errorText,
-        'Please check if the browser is running or if the Playwright MCP / CDP connection is configured correctly.'
-      );
-    }
-
-    if (result?.content) {
-      const textParts = result.content.filter((c: any) => c.type === 'text');
-      if (textParts.length >= 1) {
-        let text = textParts[textParts.length - 1].text; // Usually the main output is in the last text block
-
-        // Some versions of the MCP return error text without the `isError` boolean flag
-        if (typeof text === 'string' && text.trim().startsWith('### Error')) {
-            throw new BrowserConnectError(
-              text.trim(),
-              'Please check if the browser is running or if the Playwright MCP / CDP connection is configured correctly.'
-            );
-        }
-
-        // MCP browser_evaluate returns: "[JSON]\n### Ran Playwright code\n```js\n...\n```"
-        // Strip the "### Ran Playwright code" suffix to get clean JSON
-        const codeMarker = text.indexOf('### Ran Playwright code');
-        if (codeMarker !== -1) {
-          text = text.slice(0, codeMarker).trim();
-        }
-        // Also handle "### Result\n[JSON]" format (some MCP versions)
-        const resultMarker = text.indexOf('### Result\n');
-        if (resultMarker !== -1) {
-          text = text.slice(resultMarker + '### Result\n'.length).trim();
-        }
-        try { return JSON.parse(text); } catch { return text; }
-      }
-    }
-    return result;
+  /** Helper: spread tabId into command params if we have one */
+  private _tabOpt(): { tabId: number } | Record<string, never> {
+    return this._tabId !== undefined ? { tabId: this._tabId } : {};
   }
 
-  // --- High-level methods ---
-
   async goto(url: string): Promise<void> {
-    await this.call('tools/call', { name: 'browser_navigate', arguments: { url } });
+    const result = await sendCommand('navigate', {
+      url,
+      ...this._tabOpt(),
+    }) as { tabId?: number };
+    // Remember the tabId for subsequent exec calls
+    if (result?.tabId) {
+      this._tabId = result.tabId;
+    }
   }
 
   async evaluate(js: string): Promise<any> {
-    // Normalize IIFE format to function format expected by MCP browser_evaluate
-    const normalized = normalizeEvaluateSource(js);
-    return this.call('tools/call', { name: 'browser_evaluate', arguments: { function: normalized } });
+    const code = wrapForEval(js);
+    return sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async snapshot(opts: { interactive?: boolean; compact?: boolean; maxDepth?: number; raw?: boolean } = {}): Promise<any> {
-    const raw = await this.call('tools/call', { name: 'browser_snapshot', arguments: {} });
+    const maxDepth = Math.max(1, Math.min(Number(opts.maxDepth) || 50, 200));
+    const code = `
+      (async () => {
+        function buildTree(node, depth) {
+          if (depth > ${maxDepth}) return '';
+          const role = node.getAttribute?.('role') || node.tagName?.toLowerCase() || 'generic';
+          const name = node.getAttribute?.('aria-label') || node.getAttribute?.('alt') || node.textContent?.trim().slice(0, 80) || '';
+          const isInteractive = ['a', 'button', 'input', 'select', 'textarea'].includes(node.tagName?.toLowerCase()) || node.getAttribute?.('tabindex') != null;
+
+          ${opts.interactive ? 'if (!isInteractive && !node.children?.length) return "";' : ''}
+
+          let indent = '  '.repeat(depth);
+          let line = indent + role;
+          if (name) line += ' "' + name.replace(/"/g, '\\\\"') + '"';
+          if (node.tagName?.toLowerCase() === 'a' && node.href) line += ' [' + node.href + ']';
+          if (node.tagName?.toLowerCase() === 'input') line += ' [' + (node.type || 'text') + ']';
+
+          let result = line + '\\n';
+          if (node.children) {
+            for (const child of node.children) {
+              result += buildTree(child, depth + 1);
+            }
+          }
+          return result;
+        }
+        return buildTree(document.body, 0);
+      })()
+    `;
+    const raw = await sendCommand('exec', { code, ...this._tabOpt() });
     if (opts.raw) return raw;
     if (typeof raw === 'string') return formatSnapshot(raw, opts);
     return raw;
   }
 
   async click(ref: string): Promise<void> {
-    await this.call('tools/call', { name: 'browser_click', arguments: { element: 'click target', ref } });
+    const safeRef = JSON.stringify(ref);
+    const code = `
+      (() => {
+        const ref = ${safeRef};
+        const el = document.querySelector('[data-ref="' + ref + '"]')
+          || document.querySelectorAll('a, button, input, [role="button"], [tabindex]')[parseInt(ref, 10) || 0];
+        if (!el) throw new Error('Element not found: ' + ref);
+        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+        el.click();
+        return 'clicked';
+      })()
+    `;
+    await sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async typeText(ref: string, text: string): Promise<void> {
-    await this.call('tools/call', { name: 'browser_type', arguments: { element: 'type target', ref, text } });
+    const safeRef = JSON.stringify(ref);
+    const safeText = JSON.stringify(text);
+    const code = `
+      (() => {
+        const ref = ${safeRef};
+        const el = document.querySelector('[data-ref="' + ref + '"]')
+          || document.querySelectorAll('input, textarea, [contenteditable]')[parseInt(ref, 10) || 0];
+        if (!el) throw new Error('Element not found: ' + ref);
+        el.focus();
+        el.value = ${safeText};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'typed';
+      })()
+    `;
+    await sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async pressKey(key: string): Promise<void> {
-    await this.call('tools/call', { name: 'browser_press_key', arguments: { key } });
+    const code = `
+      (() => {
+        const el = document.activeElement || document.body;
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { key: ${JSON.stringify(key)}, bubbles: true }));
+        return 'pressed';
+      })()
+    `;
+    await sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async wait(options: number | { text?: string; time?: number; timeout?: number }): Promise<void> {
     if (typeof options === 'number') {
-      await this.call('tools/call', { name: 'browser_wait_for', arguments: { time: options } });
-    } else {
-      // Pass directly to native wait_for, which supports natively awaiting text strings without heavy DOM polling
-      await this.call('tools/call', { name: 'browser_wait_for', arguments: options });
+      await new Promise(resolve => setTimeout(resolve, options * 1000));
+      return;
+    }
+    if (options.time) {
+      await new Promise(resolve => setTimeout(resolve, options.time! * 1000));
+      return;
+    }
+    if (options.text) {
+      const timeout = (options.timeout ?? 30) * 1000;
+      const code = `
+        new Promise((resolve, reject) => {
+          const deadline = Date.now() + ${timeout};
+          const check = () => {
+            if (document.body.innerText.includes(${JSON.stringify(options.text)})) return resolve('found');
+            if (Date.now() > deadline) return reject(new Error('Text not found: ' + ${JSON.stringify(options.text)}));
+            setTimeout(check, 200);
+          };
+          check();
+        })
+      `;
+      await sendCommand('exec', { code, ...this._tabOpt() });
     }
   }
 
   async tabs(): Promise<any> {
-    return this.call('tools/call', { name: 'browser_tabs', arguments: { action: 'list' } });
+    return sendCommand('tabs', { op: 'list' });
   }
 
   async closeTab(index?: number): Promise<void> {
-    await this.call('tools/call', { name: 'browser_tabs', arguments: { action: 'close', ...(index !== undefined ? { index } : {}) } });
+    await sendCommand('tabs', { op: 'close', ...(index !== undefined ? { index } : {}) });
   }
 
   async newTab(): Promise<void> {
-    await this.call('tools/call', { name: 'browser_tabs', arguments: { action: 'new' } });
+    await sendCommand('tabs', { op: 'new' });
   }
 
   async selectTab(index: number): Promise<void> {
-    await this.call('tools/call', { name: 'browser_tabs', arguments: { action: 'select', index } });
+    await sendCommand('tabs', { op: 'select', index });
   }
 
   async networkRequests(includeStatic: boolean = false): Promise<any> {
-    return this.call('tools/call', { name: 'browser_network_requests', arguments: { includeStatic } });
+    const code = `
+      (() => {
+        const entries = performance.getEntriesByType('resource');
+        return entries
+          ${includeStatic ? '' : '.filter(e => !["img", "font", "css", "script"].some(t => e.initiatorType === t))'}
+          .map(e => ({
+            url: e.name,
+            type: e.initiatorType,
+            duration: Math.round(e.duration),
+            size: e.transferSize || 0,
+          }));
+      })()
+    `;
+    return sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async consoleMessages(level: string = 'info'): Promise<any> {
-    return this.call('tools/call', { name: 'browser_console_messages', arguments: { level } });
+    // Console messages can't be retrospectively read via CDP Runtime.evaluate.
+    // Would need Runtime.consoleAPICalled event listener, which is not yet implemented.
+    if (process.env.OPENCLI_VERBOSE) {
+      console.error('[page] consoleMessages() not supported in lightweight mode — returning empty');
+    }
+    return [];
   }
 
-  async scroll(direction: string = 'down', _amount: number = 500): Promise<void> {
-    await this.call('tools/call', { name: 'browser_press_key', arguments: { key: direction === 'down' ? 'PageDown' : 'PageUp' } });
+  /**
+   * Capture a screenshot via CDP Page.captureScreenshot.
+   * @param options.format - 'png' (default) or 'jpeg'
+   * @param options.quality - JPEG quality 0-100
+   * @param options.fullPage - capture full scrollable page
+   * @param options.path - save to file path (returns base64 if omitted)
+   */
+  async screenshot(options: {
+    format?: 'png' | 'jpeg';
+    quality?: number;
+    fullPage?: boolean;
+    path?: string;
+  } = {}): Promise<string> {
+    const base64 = await sendCommand('screenshot', {
+      format: options.format,
+      quality: options.quality,
+      fullPage: options.fullPage,
+      ...this._tabOpt(),
+    }) as string;
+
+    if (options.path) {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const dir = path.dirname(options.path);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(options.path, Buffer.from(base64, 'base64'));
+    }
+
+    return base64;
+  }
+
+  async scroll(direction: string = 'down', amount: number = 500): Promise<void> {
+    const dx = direction === 'left' ? -amount : direction === 'right' ? amount : 0;
+    const dy = direction === 'up' ? -amount : direction === 'down' ? amount : 0;
+    await sendCommand('exec', {
+      code: `window.scrollBy(${dx}, ${dy})`,
+      ...this._tabOpt(),
+    });
   }
 
   async autoScroll(options: { times?: number; delayMs?: number } = {}): Promise<void> {
     const times = options.times ?? 3;
     const delayMs = options.delayMs ?? 2000;
-    const js = `
-      async () => {
-        const maxTimes = ${times};
-        const maxWaitMs = ${delayMs};
-        for (let i = 0; i < maxTimes; i++) {
+    const code = `
+      (async () => {
+        for (let i = 0; i < ${times}; i++) {
           const lastHeight = document.body.scrollHeight;
           window.scrollTo(0, lastHeight);
           await new Promise(resolve => {
@@ -142,30 +246,60 @@ export class Page implements IPage {
               if (document.body.scrollHeight > lastHeight) {
                 clearTimeout(timeoutId);
                 observer.disconnect();
-                setTimeout(resolve, 100); // Small debounce for rendering
+                setTimeout(resolve, 100);
               }
             });
             observer.observe(document.body, { childList: true, subtree: true });
-            timeoutId = setTimeout(() => {
-              observer.disconnect();
-              resolve(null);
-            }, maxWaitMs);
+            timeoutId = setTimeout(() => { observer.disconnect(); resolve(null); }, ${delayMs});
           });
         }
-      }
+      })()
     `;
-    await this.evaluate(js);
+    await sendCommand('exec', { code, ...this._tabOpt() });
   }
 
   async installInterceptor(pattern: string): Promise<void> {
-    await this.evaluate(generateInterceptorJs(JSON.stringify(pattern), {
-      arrayName: '__opencli_xhr',
-      patchGuard: '__opencli_interceptor_patched',
-    }));
+    const { generateInterceptorJs } = await import('../interceptor.js');
+    await sendCommand('exec', {
+      code: generateInterceptorJs(JSON.stringify(pattern), {
+        arrayName: '__opencli_xhr',
+        patchGuard: '__opencli_interceptor_patched',
+      }),
+      ...this._tabOpt(),
+    });
   }
 
   async getInterceptedRequests(): Promise<any[]> {
-    const result = await this.evaluate(generateReadInterceptedJs('__opencli_xhr'));
-    return result || [];
+    const { generateReadInterceptedJs } = await import('../interceptor.js');
+    const result = await sendCommand('exec', {
+      code: generateReadInterceptedJs('__opencli_xhr'),
+      ...this._tabOpt(),
+    });
+    return (result as any[]) || [];
   }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Wrap JS code for CDP Runtime.evaluate:
+ * - Already an IIFE `(...)()` → send as-is
+ * - Arrow/function literal → wrap as IIFE `(code)()`
+ * - `new Promise(...)` or raw expression → send as-is (expression)
+ */
+function wrapForEval(js: string): string {
+  const code = js.trim();
+  if (!code) return 'undefined';
+
+  // Already an IIFE: `(async () => { ... })()` or `(function() {...})()`
+  if (/^\([\s\S]*\)\s*\(.*\)\s*$/.test(code)) return code;
+
+  // Arrow function: `() => ...` or `async () => ...`
+  if (/^(async\s+)?(\([^)]*\)|[A-Za-z_]\w*)\s*=>/.test(code)) return `(${code})()`;
+
+  // Function declaration: `function ...` or `async function ...`
+  if (/^(async\s+)?function[\s(]/.test(code)) return `(${code})()`;
+
+  // Everything else: bare expression, `new Promise(...)`, etc. → evaluate directly
+  return code;
 }
