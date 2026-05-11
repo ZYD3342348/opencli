@@ -6,20 +6,10 @@
  */
 
 export { Page } from './page.js';
-export { PlaywrightMCP } from './mcp.js';
-export { isDaemonRunning } from './daemon-client.js';
-
-// Backward compatibility: getTokenFingerprint is no longer needed but kept as no-op export
-export function getTokenFingerprint(_token: string | undefined): string | null {
-  return null;
-}
-
-import { extractTabEntries, diffTabIndexes, appendLimited } from './tabs.js';
-import { withTimeoutMs } from '../runtime.js';
-
-export const __test__ = {
-  extractTabEntries,
-  diffTabIndexes,
-  appendLimited,
-  withTimeoutMs,
-};
+export { BrowserBridge } from './bridge.js';
+export { CDPBridge } from './cdp.js';
+export { getDaemonHealth } from './daemon-client.js';
+export type { DaemonHealth } from './daemon-client.js';
+export { generateSnapshotJs, scrollToRefJs, getFormStateJs } from './dom-snapshot.js';
+export { generateStealthJs } from './stealth.js';
+export type { DomSnapshotOptions } from './dom-snapshot.js';

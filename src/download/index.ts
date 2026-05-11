@@ -2,20 +2,29 @@
  * Download utilities: HTTP downloads, yt-dlp wrapper, format conversion.
  */
 
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as https from 'node:https';
-import * as http from 'node:http';
 import * as os from 'node:os';
+import { Readable, Transform } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
+import { pipeline } from 'node:stream/promises';
 import { URL } from 'node:url';
 import type { ProgressBar } from './progress.js';
+import { isBinaryInstalled } from '../external.js';
+import type { BrowserCookie } from '../types.js';
+import { getErrorMessage } from '../errors.js';
+import { fetchWithNodeNetwork } from '../node-network.js';
+import { log } from '../logger.js';
+
+export type { BrowserCookie } from '../types.js';
 
 export interface DownloadOptions {
   cookies?: string;
   headers?: Record<string, string>;
   timeout?: number;
   onProgress?: (received: number, total: number) => void;
+  maxRedirects?: number;
 }
 
 export interface YtdlpOptions {
@@ -26,68 +35,38 @@ export interface YtdlpOptions {
   onProgress?: (percent: number) => void;
 }
 
-/**
- * Check if yt-dlp is available in PATH.
- */
+/** Check if yt-dlp is available in PATH. */
 export function checkYtdlp(): boolean {
-  try {
-    execSync('yt-dlp --version', { encoding: 'utf-8', stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
+  return isBinaryInstalled('yt-dlp');
 }
 
-/**
- * Check if ffmpeg is available in PATH.
- */
-export function checkFfmpeg(): boolean {
-  try {
-    execSync('ffmpeg -version', { encoding: 'utf-8', stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
+/** Domains that host video content and can be downloaded via yt-dlp. */
+const VIDEO_PLATFORM_DOMAINS = [
+  'youtube.com', 'youtu.be', 'bilibili.com', 'twitter.com',
+  'x.com', 'tiktok.com', 'vimeo.com', 'twitch.tv',
+];
+
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.m3u8', '.ts']);
+const DOC_EXTENSIONS = new Set(['.html', '.htm', '.json', '.xml', '.txt', '.md', '.markdown']);
 
 /**
  * Detect content type from URL and optional headers.
  */
 export function detectContentType(url: string, contentType?: string): 'image' | 'video' | 'document' | 'binary' {
-  // Check content-type header first
   if (contentType) {
     if (contentType.startsWith('image/')) return 'image';
     if (contentType.startsWith('video/')) return 'video';
     if (contentType.startsWith('text/') || contentType.includes('json') || contentType.includes('xml')) return 'document';
   }
 
-  // Detect from URL
   const urlLower = url.toLowerCase();
   const ext = path.extname(new URL(url).pathname).toLowerCase();
 
-  // Image extensions
-  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif'].includes(ext)) {
-    return 'image';
-  }
-
-  // Video extensions
-  if (['.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.m3u8', '.ts'].includes(ext)) {
-    return 'video';
-  }
-
-  // Video platforms (need yt-dlp)
-  if (urlLower.includes('youtube.com') || urlLower.includes('youtu.be') ||
-      urlLower.includes('bilibili.com') || urlLower.includes('twitter.com') ||
-      urlLower.includes('x.com') || urlLower.includes('tiktok.com') ||
-      urlLower.includes('vimeo.com') || urlLower.includes('twitch.tv')) {
-    return 'video';
-  }
-
-  // Document extensions
-  if (['.html', '.htm', '.json', '.xml', '.txt', '.md', '.markdown'].includes(ext)) {
-    return 'document';
-  }
-
+  if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+  if (VIDEO_PLATFORM_DOMAINS.some(d => urlLower.includes(d))) return 'video';
+  if (DOC_EXTENSIONS.has(ext)) return 'document';
   return 'binary';
 }
 
@@ -96,16 +75,7 @@ export function detectContentType(url: string, contentType?: string): 'image' | 
  */
 export function requiresYtdlp(url: string): boolean {
   const urlLower = url.toLowerCase();
-  return (
-    urlLower.includes('youtube.com') ||
-    urlLower.includes('youtu.be') ||
-    urlLower.includes('bilibili.com/video') ||
-    urlLower.includes('twitter.com') ||
-    urlLower.includes('x.com') ||
-    urlLower.includes('tiktok.com') ||
-    urlLower.includes('vimeo.com') ||
-    urlLower.includes('twitch.tv')
-  );
+  return VIDEO_PLATFORM_DOMAINS.some(d => urlLower.includes(d));
 }
 
 /**
@@ -115,83 +85,115 @@ export async function httpDownload(
   url: string,
   destPath: string,
   options: DownloadOptions = {},
+  redirectCount = 0,
 ): Promise<{ success: boolean; size: number; error?: string }> {
-  const { cookies, headers = {}, timeout = 30000, onProgress } = options;
+  const { cookies, headers = {}, timeout = 30000, onProgress, maxRedirects = 10 } = options;
 
-  return new Promise((resolve) => {
-    const parsedUrl = new URL(url);
-    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+  const requestHeaders: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+    ...headers,
+  };
 
-    const requestHeaders: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      ...headers,
-    };
+  if (cookies) {
+    requestHeaders['Cookie'] = cookies;
+  }
 
-    if (cookies) {
-      requestHeaders['Cookie'] = cookies;
+  const tempPath = `${destPath}.tmp`;
+
+  const cleanupTempFile = async () => {
+    try {
+      await fs.promises.rm(tempPath, { force: true });
+    } catch {
+      // Ignore cleanup errors so the original failure is preserved.
+    }
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetchWithNodeNetwork(url, {
+      headers: requestHeaders,
+      signal: controller.signal,
+      redirect: 'manual',
+    });
+    clearTimeout(timer);
+
+    // Handle redirects before creating any file handles.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (location) {
+        if (redirectCount >= maxRedirects) {
+          return { success: false, size: 0, error: `Too many redirects (> ${maxRedirects})` };
+        }
+        const redirectUrl = resolveRedirectUrl(url, location);
+        const originalHost = new URL(url).hostname;
+        const redirectHost = new URL(redirectUrl).hostname;
+        const redirectOptions = originalHost === redirectHost
+          ? options
+          : { ...options, cookies: undefined, headers: stripCookieHeaders(options.headers) };
+        return httpDownload(
+          redirectUrl,
+          destPath,
+          redirectOptions,
+          redirectCount + 1,
+        );
+      }
     }
 
-    // Ensure directory exists
-    const dir = path.dirname(destPath);
-    fs.mkdirSync(dir, { recursive: true });
+    if (response.status !== 200) {
+      return { success: false, size: 0, error: `HTTP ${response.status}` };
+    }
 
-    const tempPath = `${destPath}.tmp`;
-    const file = fs.createWriteStream(tempPath);
+    if (!response.body) {
+      return { success: false, size: 0, error: 'Empty response body' };
+    }
 
-    const request = protocol.get(url, { headers: requestHeaders, timeout }, (response) => {
-      // Handle redirects
-      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        file.close();
-        fs.unlinkSync(tempPath);
-        httpDownload(response.headers.location, destPath, options).then(resolve);
-        return;
-      }
-
-      if (response.statusCode !== 200) {
-        file.close();
-        fs.unlinkSync(tempPath);
-        resolve({ success: false, size: 0, error: `HTTP ${response.statusCode}` });
-        return;
-      }
-
-      const totalSize = parseInt(response.headers['content-length'] || '0', 10);
-      let received = 0;
-
-      response.on('data', (chunk: Buffer) => {
+    const totalSize = parseInt(response.headers.get('content-length') || '0', 10);
+    let received = 0;
+    const progressStream = new Transform({
+      transform(chunk, _encoding, callback) {
         received += chunk.length;
         if (onProgress) onProgress(received, totalSize);
-      });
-
-      response.pipe(file);
-
-      file.on('finish', () => {
-        file.close();
-        // Rename temp file to final destination
-        fs.renameSync(tempPath, destPath);
-        resolve({ success: true, size: received });
-      });
+        callback(null, chunk);
+      },
     });
 
-    request.on('error', (err) => {
-      file.close();
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      resolve({ success: false, size: 0, error: err.message });
-    });
+    try {
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await pipeline(
+        Readable.fromWeb(response.body as unknown as WebReadableStream),
+        progressStream,
+        fs.createWriteStream(tempPath),
+      );
+      await fs.promises.rename(tempPath, destPath);
+      return { success: true, size: received };
+    } catch (err) {
+      await cleanupTempFile();
+      return { success: false, size: 0, error: getErrorMessage(err) };
+    }
+  } catch (err) {
+    clearTimeout(timer);
+    await cleanupTempFile();
+    return { success: false, size: 0, error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
-    request.on('timeout', () => {
-      request.destroy();
-      file.close();
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      resolve({ success: false, size: 0, error: 'Timeout' });
-    });
-  });
+export function resolveRedirectUrl(currentUrl: string, location: string): string {
+  return new URL(location, currentUrl).toString();
+}
+
+function stripCookieHeaders(headers?: Record<string, string>): Record<string, string> | undefined {
+  if (!headers) return headers;
+  return Object.fromEntries(
+    Object.entries(headers).filter(([key]) => key.toLowerCase() !== 'cookie'),
+  );
 }
 
 /**
  * Export cookies to Netscape format for yt-dlp.
  */
 export function exportCookiesToNetscape(
-  cookies: Array<{ name: string; value: string; domain: string; path?: string; secure?: boolean; httpOnly?: boolean }>,
+  cookies: BrowserCookie[],
   filePath: string,
 ): void {
   const lines = [
@@ -206,12 +208,20 @@ export function exportCookiesToNetscape(
     const includeSubdomains = 'TRUE';
     const cookiePath = cookie.path || '/';
     const secure = cookie.secure ? 'TRUE' : 'FALSE';
-    const expiry = Math.floor(Date.now() / 1000) + 86400 * 365; // 1 year from now
-    lines.push(`${domain}\t${includeSubdomains}\t${cookiePath}\t${secure}\t${expiry}\t${cookie.name}\t${cookie.value}`);
+    const expiry = typeof cookie.expirationDate === 'number' && cookie.expirationDate > 0
+      ? Math.floor(cookie.expirationDate)
+      : Math.floor(Date.now() / 1000) + 86400 * 365; // fallback: 1 year from now
+    const safeName = cookie.name.replace(/[\t\n\r]/g, '');
+    const safeValue = cookie.value.replace(/[\t\n\r]/g, '');
+    lines.push(`${domain}\t${includeSubdomains}\t${cookiePath}\t${secure}\t${expiry}\t${safeName}\t${safeValue}`);
   }
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, lines.join('\n'));
+}
+
+export function formatCookieHeader(cookies: BrowserCookie[]): string {
+  return cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
 }
 
 /**
@@ -241,8 +251,13 @@ export async function ytdlpDownload(
       '--progress',
     ];
 
-    if (cookiesFile && fs.existsSync(cookiesFile)) {
-      args.push('--cookies', cookiesFile);
+    if (cookiesFile) {
+      if (fs.existsSync(cookiesFile)) {
+        args.push('--cookies', cookiesFile);
+      } else {
+        log.warn(`[download] Cookies file not found: ${cookiesFile}, falling back to browser cookies`);
+        args.push('--cookies-from-browser', 'chrome');
+      }
     } else {
       // Try to use browser cookies
       args.push('--cookies-from-browser', 'chrome');
@@ -314,7 +329,7 @@ export async function saveDocument(
   content: string,
   destPath: string,
   format: 'json' | 'markdown' | 'html' | 'text' = 'markdown',
-  metadata?: Record<string, any>,
+  metadata?: Record<string, unknown>,
 ): Promise<{ success: boolean; size: number; error?: string }> {
   try {
     const dir = path.dirname(destPath);
@@ -334,8 +349,8 @@ export async function saveDocument(
 
     fs.writeFileSync(destPath, output, 'utf-8');
     return { success: true, size: Buffer.byteLength(output, 'utf-8') };
-  } catch (err: any) {
-    return { success: false, size: 0, error: err.message };
+  } catch (err) {
+    return { success: false, size: 0, error: getErrorMessage(err) };
   }
 }
 

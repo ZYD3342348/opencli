@@ -4,6 +4,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { executePipeline } from './index.js';
+import { ConfigError } from '../errors.js';
 import type { IPage } from '../types.js';
 
 /** Create a minimal mock page for testing */
@@ -11,22 +12,26 @@ function createMockPage(overrides: Partial<IPage> = {}): IPage {
   return {
     goto: vi.fn(),
     evaluate: vi.fn().mockResolvedValue(null),
+    fetchJson: vi.fn().mockResolvedValue(null),
+    getCookies: vi.fn().mockResolvedValue([]),
     snapshot: vi.fn().mockResolvedValue(''),
     click: vi.fn(),
     typeText: vi.fn(),
+    fillText: vi.fn(),
     pressKey: vi.fn(),
+    getFormState: vi.fn().mockResolvedValue({}),
     wait: vi.fn(),
     tabs: vi.fn().mockResolvedValue([]),
-    closeTab: vi.fn(),
-    newTab: vi.fn(),
     selectTab: vi.fn(),
     networkRequests: vi.fn().mockResolvedValue([]),
     consoleMessages: vi.fn().mockResolvedValue(''),
     scroll: vi.fn(),
+    scrollTo: vi.fn(),
     autoScroll: vi.fn(),
     installInterceptor: vi.fn(),
     getInterceptedRequests: vi.fn().mockResolvedValue([]),
     screenshot: vi.fn().mockResolvedValue(''),
+    waitForCapture: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -38,7 +43,7 @@ describe('executePipeline', () => {
   });
 
   it('skips null/invalid steps', async () => {
-    const result = await executePipeline(null, [null, undefined, 42] as any);
+    const result = await executePipeline(null, [null, undefined, 42]);
     expect(result).toBeNull();
   });
 
@@ -75,6 +80,32 @@ describe('executePipeline', () => {
     expect(result).toEqual([
       { name: 'Hello', score: 10 },
       { name: 'World', score: 20 },
+    ]);
+  });
+
+  it('runs inline select inside map step', async () => {
+    const page = createMockPage({
+      evaluate: vi.fn().mockResolvedValue({
+        posts: [
+          { title: 'First', rank: 1 },
+          { title: 'Second', rank: 2 },
+        ],
+      }),
+    });
+    const result = await executePipeline(page, [
+      { evaluate: 'test' },
+      {
+        map: {
+          select: 'posts',
+          title: '${{ item.title }}',
+          rank: '${{ item.rank }}',
+        },
+      },
+    ]);
+
+    expect(result).toEqual([
+      { title: 'First', rank: 1 },
+      { title: 'Second', rank: 2 },
     ]);
   });
 
@@ -119,13 +150,13 @@ describe('executePipeline', () => {
     expect(page.wait).toHaveBeenCalledWith(2);
   });
 
-  it('handles unknown steps gracefully in debug mode', async () => {
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    await executePipeline(null, [
+  it('fails fast on unknown steps', async () => {
+    await expect(executePipeline(null, [
       { unknownStep: 'test' },
-    ], { debug: true });
-    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('Unknown step'));
-    stderr.mockRestore();
+    ], { debug: true })).rejects.toBeInstanceOf(ConfigError);
+    await expect(executePipeline(null, [
+      { unknownStep: 'test' },
+    ], { debug: true })).rejects.toThrow('Unknown pipeline step "unknownStep"');
   });
 
   it('passes args through template rendering', async () => {
@@ -145,6 +176,14 @@ describe('executePipeline', () => {
       { click: '@5' },
     ]);
     expect(page.click).toHaveBeenCalledWith('5');
+  });
+
+  it('fill step calls page.fillText with raw rendered text', async () => {
+    const page = createMockPage();
+    await executePipeline(page, [
+      { fill: { ref: '@5', text: 'line1\\n/ / ${{ args.tail }}' } },
+    ], { args: { tail: 'raw' } });
+    expect(page.fillText).toHaveBeenCalledWith('5', 'line1\\n/ / raw');
   });
 
   it('navigate preserves existing data through pipeline', async () => {

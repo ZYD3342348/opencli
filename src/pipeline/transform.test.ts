@@ -58,6 +58,35 @@ describe('stepMap', () => {
   it('returns null/undefined as-is', async () => {
     expect(await stepMap(null, { x: '${{ item.x }}' }, null, {})).toBeNull();
   });
+
+  it('supports inline select before mapping', async () => {
+    const result = await stepMap(null, {
+      select: 'posts',
+      title: '${{ item.title }}',
+      rank: '${{ index + 1 }}',
+    }, { posts: [{ title: 'One' }, { title: 'Two' }] }, {});
+
+    expect(result).toEqual([
+      { title: 'One', rank: 1 },
+      { title: 'Two', rank: 2 },
+    ]);
+  });
+
+  it('keeps data bound to the selected source and exposes root separately', async () => {
+    const result = await stepMap(null, {
+      select: 'bids',
+      bid_price: '${{ data[index][0] }}',
+      ask_price: '${{ root.asks[index][0] }}',
+    }, {
+      bids: [['100', '2'], ['99', '3']],
+      asks: [['101', '1'], ['102', '4']],
+    }, {});
+
+    expect(result).toEqual([
+      { bid_price: '100', ask_price: '101' },
+      { bid_price: '99', ask_price: '102' },
+    ]);
+  });
 });
 
 describe('stepFilter', () => {
@@ -75,18 +104,38 @@ describe('stepFilter', () => {
 describe('stepSort', () => {
   it('sorts ascending by key', async () => {
     const result = await stepSort(null, 'score', SAMPLE_DATA, {});
-    expect(result.map((r: any) => r.title)).toEqual(['Alpha', 'Gamma', 'Beta']);
+    expect((result as typeof SAMPLE_DATA).map((r) => r.title)).toEqual(['Alpha', 'Gamma', 'Beta']);
   });
 
   it('sorts descending', async () => {
     const result = await stepSort(null, { by: 'score', order: 'desc' }, SAMPLE_DATA, {});
-    expect(result.map((r: any) => r.title)).toEqual(['Beta', 'Gamma', 'Alpha']);
+    expect((result as typeof SAMPLE_DATA).map((r) => r.title)).toEqual(['Beta', 'Gamma', 'Alpha']);
   });
 
   it('does not mutate original', async () => {
     const original = [...SAMPLE_DATA];
     await stepSort(null, 'score', SAMPLE_DATA, {});
     expect(SAMPLE_DATA).toEqual(original);
+  });
+
+  it('sorts string-encoded numbers naturally by default', async () => {
+    const data = [
+      { name: 'A', volume: '99' },
+      { name: 'B', volume: '1000' },
+      { name: 'C', volume: '250' },
+    ];
+    const result = await stepSort(null, { by: 'volume', order: 'desc' }, data, {});
+    expect((result as typeof data).map((r) => r.name)).toEqual(['B', 'C', 'A']);
+  });
+
+  it('handles missing fields gracefully', async () => {
+    const data = [
+      { name: 'A', value: '10' },
+      { name: 'B' },
+      { name: 'C', value: '5' },
+    ];
+    const result = await stepSort(null, { by: 'value', order: 'asc' }, data, {});
+    expect((result as typeof data).map((r) => r.name)).toEqual(['B', 'C', 'A']);
   });
 });
 

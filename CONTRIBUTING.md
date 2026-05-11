@@ -17,7 +17,7 @@ npm run build
 
 # 4. Run a few checks
 npx tsc --noEmit
-npx vitest run src/
+npm test
 
 # 5. Link globally (optional, for testing `opencli` command)
 npm link
@@ -25,49 +25,48 @@ npm link
 
 ## Adding a New Site Adapter
 
-This is the most common type of contribution. Start with YAML when possible, and use TypeScript only when you need browser-side logic or multi-step flows.
+All adapters use TypeScript. Use the pipeline API for data-fetching commands, and `func()` for complex browser interactions.
 
-### YAML Adapter (Recommended for data-fetching commands)
+### Pipeline Adapter (Recommended for data-fetching commands)
 
-Create a file like `src/clis/<site>/<command>.yaml`:
-
-```yaml
-site: mysite
-name: trending
-description: Trending posts on MySite
-domain: www.mysite.com
-strategy: public      # public | cookie | header
-browser: false        # true if browser session is needed
-
-args:
-  limit:
-    type: int
-    default: 20
-    description: Number of items
-
-pipeline:
-  - fetch:
-      url: https://api.mysite.com/trending
-
-  - map:
-      rank: ${{ index + 1 }}
-      title: ${{ item.title }}
-      score: ${{ item.score }}
-      url: ${{ item.url }}
-
-  - limit: ${{ args.limit }}
-
-columns: [rank, title, score, url]
-```
-
-See [`hackernews/top.yaml`](src/clis/hackernews/top.yaml) for a real example.
-
-### TypeScript Adapter (For complex browser interactions)
-
-Create a file like `src/clis/<site>/<command>.ts`:
+Create a file like `clis/<site>/<command>.js`:
 
 ```typescript
-import { cli, Strategy } from '../../registry.js';
+import { cli, Strategy } from '@jackwener/opencli/registry';
+
+cli({
+  site: 'mysite',
+  name: 'trending',
+  description: 'Trending posts on MySite',
+  domain: 'www.mysite.com',
+  strategy: Strategy.PUBLIC,
+  browser: false,
+  args: [
+    { name: 'query', positional: true, required: true, help: 'Search keyword' },
+    { name: 'limit', type: 'int', default: 20, help: 'Number of items' },
+  ],
+  columns: ['rank', 'title', 'score', 'url'],
+  pipeline: [
+    { fetch: { url: 'https://api.mysite.com/trending' } },
+    { map: {
+        rank: '${{ index + 1 }}',
+        title: '${{ item.title }}',
+        score: '${{ item.score }}',
+        url: '${{ item.url }}',
+    }},
+    { limit: '${{ args.limit }}' },
+  ],
+});
+```
+
+See [`hackernews/top.js`](clis/hackernews/top.js) for a real example.
+
+### func() Adapter (For complex browser interactions)
+
+Create a file like `clis/<site>/<command>.js`:
+
+```typescript
+import { cli, Strategy } from '@jackwener/opencli/registry';
 
 cli({
   site: 'mysite',
@@ -76,7 +75,7 @@ cli({
   domain: 'www.mysite.com',
   strategy: Strategy.COOKIE,
   args: [
-    { name: 'query', required: true, help: 'Search query' },
+    { name: 'query', positional: true, required: true, help: 'Search query' },
     { name: 'limit', type: 'int', default: 10, help: 'Max results' },
   ],
   columns: ['title', 'url', 'date'],
@@ -103,12 +102,12 @@ cli({
 });
 ```
 
-Use `opencli explore <url>` to discover APIs and see [CLI-EXPLORER.md](./CLI-EXPLORER.md) if you need the full adapter workflow.
+Install the [`opencli-adapter-author` skill](./skills/opencli-adapter-author/SKILL.md) if you need the full adapter workflow — recon → API discovery → field decoding → `opencli browser verify`.
 
 ### Validate Your Adapter
 
 ```bash
-# Validate YAML syntax and schema
+# Validate adapter
 opencli validate
 
 # Test your command
@@ -118,12 +117,42 @@ opencli <site> <command> --limit 3 -f json
 opencli <site> <command> -v
 ```
 
+## Arg Design Convention
+
+Use **positional** for the primary, required argument of a command (the "what" — query, symbol, id, url, username). Use **named options** (`--flag`) for secondary/optional configuration (limit, format, sort, page, filters, language, date).
+
+**Rule of thumb**: Think about how the user will type the command. `opencli xueqiu stock SH600519` is more natural than `opencli xueqiu stock --symbol SH600519`.
+
+| Arg type | Positional? | Examples |
+|----------|-------------|----------|
+| Main target (query, symbol, id, url, username) | ✅ `positional: true` | `search '茅台'`, `stock SH600519`, `download BV1xxx` |
+| Configuration (limit, format, sort, page, type, filters) | ❌ Named `--flag` | `--limit 10`, `--format json`, `--sort hot`, `--location seattle` |
+
+Do **not** convert an argument to positional just because it appears first in the file. If the argument is optional, acts like a filter, or selects a mode/configuration, it should usually stay a named option.
+
+Pipeline example:
+```typescript
+args: [
+  { name: 'query', positional: true, required: true, help: 'Search query' },  // ← primary arg
+  { name: 'limit', type: 'int', default: 20, help: 'Max results' },           // ← config arg
+]
+```
+
+TS example:
+```typescript
+args: [
+  { name: 'query', positional: true, required: true, help: 'Search query' },
+  { name: 'limit', type: 'int', default: 10, help: 'Max results' },
+]
+```
+
 ## Testing
 
 See [TESTING.md](./TESTING.md) for the full guide and exact test locations.
 
 ```bash
-npx vitest run src/           # Unit tests
+npm test                      # Default local gate: unit + extension + adapter tests
+npm run test:adapter          # Adapter-only project (useful while iterating on adapters)
 npx vitest run tests/e2e/     # E2E tests
 npx vitest run                # All tests
 ```
@@ -156,8 +185,9 @@ Common scopes: site name (`twitter`, `reddit`) or module name (`browser`, `pipel
 3. Run the checks that apply:
    ```bash
    npx tsc --noEmit           # Type check
-   npx vitest run src/        # Unit tests
-   opencli validate           # YAML validation (if applicable)
+   npm test                   # Default local gate: unit + extension + adapter
+   npm run test:adapter       # Adapter-only project (optional while iterating on adapters)
+   opencli validate           # Adapter validation
    ```
 4. Commit using conventional commit format
 5. Push and open a PR

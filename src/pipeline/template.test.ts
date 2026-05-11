@@ -24,6 +24,9 @@ describe('resolvePath', () => {
   it('resolves data path', () => {
     expect(resolvePath('data.items', { data: { items: [1, 2, 3] } })).toEqual([1, 2, 3]);
   });
+  it('resolves root path', () => {
+    expect(resolvePath('root.items', { root: { items: [1, 2, 3] } })).toEqual([1, 2, 3]);
+  });
   it('returns null for missing path', () => {
     expect(resolvePath('args.missing', { args: {} })).toBeUndefined();
   });
@@ -54,8 +57,45 @@ describe('evalExpr', () => {
   it('evaluates || with truthy left', () => {
     expect(evalExpr("item.name || 'N/A'", { item: { name: 'Alice' } })).toBe('Alice');
   });
+  it('evaluates chained || fallback (issue #303)', () => {
+    // When first two are falsy, should evaluate through to the string literal
+    expect(evalExpr("item.a || item.b || 'default'", { item: {} })).toBe('default');
+  });
+  it('evaluates chained || with middle value truthy', () => {
+    expect(evalExpr("item.a || item.b || 'default'", { item: { b: 'middle' } })).toBe('middle');
+  });
+  it('evaluates chained || with first value truthy', () => {
+    expect(evalExpr("item.a || item.b || 'default'", { item: { a: 'first', b: 'middle' } })).toBe('first');
+  });
+  it('evaluates || with 0 as falsy left (JS semantics)', () => {
+    expect(evalExpr("item.count || 'N/A'", { item: { count: 0 } })).toBe('N/A');
+  });
+  it('evaluates || with empty string as falsy left', () => {
+    expect(evalExpr("item.name || 'unknown'", { item: { name: '' } })).toBe('unknown');
+  });
+  it('evaluates || with numeric fallback returning number type', () => {
+    expect(evalExpr('item.a || 42', { item: {} })).toBe(42);
+  });
+  it('evaluates 4-way chained ||', () => {
+    expect(evalExpr("item.a || item.b || item.c || 'last'", { item: { c: 'third' } })).toBe('third');
+  });
+  it('handles || combined with pipe filter', () => {
+    expect(evalExpr("item.a || item.b | upper", { item: { b: 'hello' } })).toBe('HELLO');
+  });
   it('resolves simple path', () => {
     expect(evalExpr('item.title', { item: { title: 'Test' } })).toBe('Test');
+  });
+  it('evaluates JS helper expressions', () => {
+    expect(evalExpr('encodeURIComponent(args.keyword)', { args: { keyword: 'hello world' } })).toBe('hello%20world');
+  });
+  it('evaluates ternary expressions', () => {
+    expect(evalExpr("args.kind === 'tech' ? 'technology' : args.kind", { args: { kind: 'tech' } })).toBe('technology');
+  });
+  it('evaluates method calls on values', () => {
+    expect(evalExpr("args.username.startsWith('@') ? args.username : '@' + args.username", { args: { username: 'alice' } })).toBe('@alice');
+  });
+  it('rejects constructor-based sandbox escapes', () => {
+    expect(evalExpr("args['cons' + 'tructor']['constructor']('return process')()", { args: {} })).toBeUndefined();
   });
   it('applies join filter', () => {
     expect(evalExpr('item.tags | join(,)', { item: { tags: ['a', 'b', 'c'] } })).toBe('a,b,c');
@@ -103,6 +143,15 @@ describe('render', () => {
   });
   it('renders URL template', () => {
     expect(render('https://api.example.com/search?q=${{ args.keyword }}', { args: { keyword: 'test' } })).toBe('https://api.example.com/search?q=test');
+  });
+  it('renders inline helper expressions', () => {
+    expect(render('https://example.com/search?q=${{ encodeURIComponent(args.keyword) }}', { args: { keyword: 'hello world' } })).toBe('https://example.com/search?q=hello%20world');
+  });
+  it('renders full multiline expressions', () => {
+    expect(render("${{\n  args.topic ? `https://medium.com/tag/${args.topic}` : 'https://medium.com/tag/technology'\n}}", { args: { topic: 'ai' } })).toBe('https://medium.com/tag/ai');
+  });
+  it('renders block expressions with surrounding whitespace', () => {
+    expect(render("\n  ${{ args.kind === 'tech' ? 'technology' : args.kind }}\n", { args: { kind: 'tech' } })).toBe('technology');
   });
 });
 
